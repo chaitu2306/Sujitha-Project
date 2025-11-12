@@ -220,5 +220,5 @@ jobs:
       - name: Deployment result
         if: success()
         run: |
-          echo "Deployment succeeded!"
-          echo "Application should be available at: http://${{ env.EC2_HOST }}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
+          # echo "Deployment succeeded!"
+          # echo "Application should be available at: http://${{ env.EC2_HOST }}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
