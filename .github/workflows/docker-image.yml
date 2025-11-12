@@ -1,4 +1,4 @@
-name: Build → Push to ECR → Deploy to EC2 (SSH)
+name: Build → Push to ECR → Deploy to EC2 (ECR only)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,6 @@ on:
         default: 'v1.0.0'
 
 env:
-  IMAGE_LOCAL_NAME: "muralisocial123/ust-test-image"
   ECR_REGISTRY: "909688465000.dkr.ecr.ap-south-1.amazonaws.com"
   ECR_REPOSITORY: "ust/training"
   AWS_REGION: "ap-south-1"
@@ -17,10 +16,10 @@ env:
   EC2_HOST: "43.204.231.70"
   EC2_SSH_PORT: "22"
   CONTAINER_NAME: "ust-training-app"
-  HEALTHCHECK_PATH: "/"              # change if your app health endpoint differs
+  HEALTHCHECK_PATH: "/"
   HEALTHCHECK_PORT: "3000"
-  HEALTHCHECK_RETRIES: "12"          # total tries
-  HEALTHCHECK_SLEEP_SECONDS: "5"     # wait between tries
+  HEALTHCHECK_RETRIES: "12"
+  HEALTHCHECK_SLEEP_SECONDS: "5"
 
 jobs:
   build-push-deploy:
@@ -69,24 +68,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push Docker image to ECR
+      - name: Build and push Docker image to ECR (ECR only)
         id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: |
-            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.validate.outputs.tag }}
-            ${{ env.IMAGE_LOCAL_NAME }}:${{ steps.validate.outputs.tag }}
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.validate.outputs.tag }}
 
-      - name: Deploy to EC2 via SSH (appleboy)
+      - name: Write PEM key to disk (from secret)
+        id: write_pem
+        run: |
+          printf "%s\n" "${{ secrets.AWS_KEY_PAIR }}" > key.pem
+          chmod 600 key.pem
+          echo "pem_path=$(pwd)/key.pem" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to EC2 via SSH (appleboy action)
         id: deploy_ssh
         uses: appleboy/ssh-action@v0.1.7
         with:
           host: ${{ env.EC2_HOST }}
           username: ${{ env.EC2_USER }}
-          key: ${{ secrets.AWS_KEY_PAIR }}           # PEM content
+          key: ${{ secrets.AWS_KEY_PAIR }}
           port: ${{ env.EC2_SSH_PORT }}
           timeout: 600
           script: |
@@ -133,8 +137,6 @@ jobs:
                 curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
                 sudo sh /tmp/get-docker.sh
               fi
-
-              # Add ec2 user to docker group (no immediate effect in current session)
               if id ec2-user >/dev/null 2>&1; then
                 sudo usermod -aG docker ec2-user || true
               fi
@@ -142,7 +144,7 @@ jobs:
               echo "Remote: docker already present: $(docker --version)"
             fi
 
-            # Install AWS CLI v2 if missing
+            # Install AWS CLI if missing
             if ! command -v aws >/dev/null 2>&1; then
               echo "Remote: AWS CLI v2 not found — installing..."
               sudo apt-get update -y || true
@@ -154,13 +156,13 @@ jobs:
               echo "Remote: aws present: $(aws --version)"
             fi
 
-            # Validate env AWS creds are present (appleboy injects environment variables)
+            # Validate AWS creds are present in environment
             if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
               echo "Remote: AWS credentials not present; aborting"
               exit 1
             fi
 
-            echo "Remote: login to ECR and pull ${IMAGE}"
+            echo "Remote: logging into ECR and pulling ${IMAGE}"
             aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
             docker pull "${IMAGE}"
 
@@ -175,44 +177,9 @@ jobs:
 
             echo "Remote: deployment finished"
             docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
-
-        # pass AWS creds as environment to remote session via SSH
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ env.AWS_REGION }}
           ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
           ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
-
-      - name: Wait for app and perform health-check
-        id: health
-        run: |
-          HOST="${{ env.EC2_HOST }}"
-          PATH="${{ env.HEALTHCHECK_PATH }}"
-          PORT="${{ env.HEALTHCHECK_PORT }}"
-          RETRIES=${{ env.HEALTHCHECK_RETRIES }}
-          SLEEP=${{ env.HEALTHCHECK_SLEEP_SECONDS }}
-
-          URL="http://${HOST}:${PORT}${PATH}"
-          echo "Waiting for ${URL} to return HTTP 200..."
-
-          i=0
-          while [ $i -lt $RETRIES ]; do
-            if curl -s -f -m 5 "${URL}" >/dev/null 2>&1; then
-              echo "Health check passed on attempt $((i+1))"
-              exit 0
-            fi
-            echo "Attempt $((i+1)) failed — retrying in ${SLEEP}s..."
-            i=$((i+1))
-            sleep ${SLEEP}
-          done
-
-          echo "::error::Health check failed after ${RETRIES} attempts: ${URL}"
-          exit 1
-
-      - name: Deployment result
-        if: success()
-        run: |
-          echo "✅ Deployment succeeded!"
-          echo "Application should be available at: http://${{ env.EC2_HOST }}:${{ env.HEALTHCHECK_PORT }}${{ env.HEALTHCHECK_PATH }}"
